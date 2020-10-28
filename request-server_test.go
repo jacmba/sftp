@@ -37,8 +37,11 @@ const sock = "/tmp/rstest.sock"
 func clientRequestServerPair(t *testing.T) *csPair {
 	skipIfWindows(t)
 	skipIfPlan9(t)
-	ready := make(chan bool)
+
+	ready := make(chan struct{})
+	canReturn := make(chan struct{})
 	os.Remove(sock) // either this or signal handling
+
 	var server *RequestServer
 	go func() {
 		l, err := net.Listen("unix", sock)
@@ -46,25 +49,36 @@ func clientRequestServerPair(t *testing.T) *csPair {
 			// neither assert nor t.Fatal reliably exit before Accept errors
 			panic(err)
 		}
-		ready <- true
+
+		close(ready)
+
 		fd, err := l.Accept()
 		require.NoError(t, err)
+
 		handlers := InMemHandler()
 		var options []RequestServerOption
 		if *testAllocator {
 			options = append(options, WithRSAllocator())
 		}
+
 		server = NewRequestServer(fd, handlers, options...)
+		close(canReturn)
+
 		server.Serve()
 	}()
+
 	<-ready
 	defer os.Remove(sock)
+
 	c, err := net.Dial("unix", sock)
 	require.NoError(t, err)
+
 	client, err := NewClientPipe(c, c)
 	if err != nil {
 		t.Fatalf("unexpected error: %+v", err)
 	}
+
+	<-canReturn
 	return &csPair{client, server}
 }
 

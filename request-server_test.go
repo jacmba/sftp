@@ -17,8 +17,9 @@ import (
 var _ = fmt.Print
 
 type csPair struct {
-	cli *Client
-	svr *RequestServer
+	cli       *Client
+	svr       *RequestServer
+	svrResult chan error
 }
 
 // these must be closed in order, else client.Close will hang
@@ -42,6 +43,10 @@ func clientRequestServerPair(t *testing.T) *csPair {
 	canReturn := make(chan struct{})
 	os.Remove(sock) // either this or signal handling
 
+	pair := &csPair{
+		svrResult: make(chan error, 1),
+	}
+
 	var server *RequestServer
 	go func() {
 		l, err := net.Listen("unix", sock)
@@ -64,7 +69,8 @@ func clientRequestServerPair(t *testing.T) *csPair {
 		server = NewRequestServer(fd, handlers, options...)
 		close(canReturn)
 
-		server.Serve()
+		err = server.Serve()
+		pair.svrResult <- err
 	}()
 
 	<-ready
@@ -79,7 +85,9 @@ func clientRequestServerPair(t *testing.T) *csPair {
 	}
 
 	<-canReturn
-	return &csPair{client, server}
+	pair.svr = server
+	pair.cli = client
+	return pair
 }
 
 func checkRequestServerAllocator(t *testing.T, p *csPair) {
@@ -243,6 +251,9 @@ func TestRequestOpenFail(t *testing.T) {
 	rf, err := p.cli.Open("/foo")
 	assert.Exactly(t, os.ErrNotExist, err)
 	assert.Nil(t, rf)
+	// if we return an error the sftp client will not close the handle
+	// ensure that we close it ourself
+	assert.Len(t, p.svr.openRequests, 0)
 	checkRequestServerAllocator(t, p)
 }
 
@@ -726,6 +737,35 @@ func TestRequestReaddir(t *testing.T) {
 	require.Len(t, di, 100)
 	names := []string{di[18].Name(), di[81].Name()}
 	assert.Equal(t, []string{"foo_18", "foo_81"}, names)
+	assert.Len(t, p.svr.openRequests, 0)
+	checkRequestServerAllocator(t, p)
+}
+
+func TestCleanDisconnect(t *testing.T) {
+	p := clientRequestServerPair(t)
+	defer p.Close()
+
+	err := p.cli.conn.Close()
+	require.NoError(t, err)
+	// server must return io.EOF after a clean client close
+	// with no pending open requests
+	err = <-p.svrResult
+	require.EqualError(t, err, io.EOF.Error())
+	checkRequestServerAllocator(t, p)
+}
+
+func TestUncleanDisconnect(t *testing.T) {
+	p := clientRequestServerPair(t)
+	defer p.Close()
+
+	foo := NewRequest("", "foo")
+	p.svr.nextRequest(foo)
+	err := p.cli.conn.Close()
+	require.NoError(t, err)
+	// the foo request above is still open after the client disconnects
+	// so the server will convert io.EOF to io.ErrUnexpectedEOF
+	err = <-p.svrResult
+	require.EqualError(t, err, io.ErrUnexpectedEOF.Error())
 	checkRequestServerAllocator(t, p)
 }
 
